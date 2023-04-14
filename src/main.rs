@@ -65,7 +65,7 @@ impl Server {
     }
 
     // P1 finishes the signing process and computes the signature
-    pub fn finish_signing(&self, client_partial_sig: &ClientPartialSig) -> party_one::Signature {
+    pub fn finish_signing(&self, client_partial_sig: &ClientPartialSig) -> party_one::BlindedSignature {
 
         let party1_private = self.party1_private.as_ref().expect("Server's party1_private not available");
         let eph_ec_key_pair_party1 = self.eph_ec_key_pair_party1.as_ref().expect("Server's eph_ec_key_pair_party1 not available");
@@ -78,11 +78,10 @@ impl Server {
             .expect("failed to verify commitments and DLog proof"); // Verify the second message of P2's ephemeral key pair generation
 
 
-        let signature = party_one::Signature::compute(
+        let signature = party_one::Signature::compute_blinded(
             party1_private,
             &client_partial_sig.partial_sig.c3,
             eph_ec_key_pair_party1,
-            &client_partial_sig.eph_party_two_second_message.comm_witness.public_share,
         ); // Compute the signature
 
         signature
@@ -107,7 +106,8 @@ pub struct Client {
 pub struct ClientPartialSig {
     eph_party_two_first_message: party_two::EphKeyGenFirstMsg,      // P2's ephemeral key pair generation first message
     eph_party_two_second_message: party_two::EphKeyGenSecondMsg,    // P2's ephemeral key pair generation second message
-    partial_sig: party_two::PartialSig                               // P2's partially signed data
+    partial_sig: party_two::PartialBlindedSig                       // P2's partially signed data
+    
 }
 
 impl Client {
@@ -147,7 +147,7 @@ impl Client {
 
         let party2_private = party_two::Party2Private::set_private_key(&self.ec_key_pair_party2);
 
-        let partial_sig = party_two::PartialSig::compute(
+        let partial_sig = party_two::PartialSig::compute_blinded(
             &server_signing_data.paillier_key_pair_ek,
             &server_signing_data.paillier_key_pair_encrypted_share,
             &party2_private,
@@ -183,7 +183,12 @@ fn main() {
     let client = Client::new(); // Initialize the client (P2) with private share key generation
     let client_partial_sig = client.partially_sign(&server_signing_data, &message); // P2 partially signs the message
 
-    let signature = server.finish_signing(&client_partial_sig); // P1 finishes signing the message with P2's partially signed data
+    let blinded_signature = server.finish_signing(&client_partial_sig); // P1 finishes signing the message with P2's partially signed data
+
+    let signature = party_one::Signature {
+        r: client_partial_sig.partial_sig.r,
+        s: blinded_signature.s,
+    };
 
     let party_two_private_share_gen_public_share = client.get_party_two_private_share_gen_public_share(); // Get P2's public share key
     server.verify_signature(&signature, &party_two_private_share_gen_public_share, &message); // Verify the signature
