@@ -1,4 +1,6 @@
-use curv::{BigInt, elliptic::curves::{Point, Secp256k1}};
+use std::cmp;
+
+use curv::{BigInt, elliptic::curves::{Point, Secp256k1, Scalar}, arithmetic::Modulo};
 use multi_party_ecdsa::protocols::two_party_ecdsa::lindell_2017::{party_one, party_two};
 
 // Server structure definition, holding party1's (P1) key shares and related data
@@ -15,6 +17,13 @@ pub struct ServerSigningData {
     paillier_key_pair_ek: paillier::EncryptionKey,              // P1's Paillier encryption key
     paillier_key_pair_encrypted_share: BigInt,                  // Encrypted share of P1's Paillier private key
     eph_party_one_first_message: party_one::EphKeyGenFirstMsg,  // P1's ephemeral key pair generation first message
+}
+
+fn generate_blinding_factor() -> (BigInt, BigInt) {
+    let b = Scalar::<Secp256k1>::random();
+    let b_inv = b.invert().unwrap();
+
+    (b.to_bigint(), b_inv.to_bigint())
 }
 
 impl Server {
@@ -78,9 +87,10 @@ impl Server {
             .expect("failed to verify commitments and DLog proof"); // Verify the second message of P2's ephemeral key pair generation
 
 
+        // P1's signature computation
         let signature = party_one::Signature::compute_blinded(
             party1_private,
-            &client_partial_sig.partial_sig.c3,
+            &client_partial_sig.partial_sig.c4,
             eph_ec_key_pair_party1,
         ); // Compute the signature
 
@@ -99,7 +109,9 @@ impl Server {
 // Client structure definition, holding party2's (P2) key shares and related data
 pub struct Client {
     party_two_private_share_gen: party_two::KeyGenFirstMsg,     // P2's private share key generation first message
-    ec_key_pair_party2: party_two::EcKeyPair                    // P2's EC key pair
+    ec_key_pair_party2: party_two::EcKeyPair,                   // P2's EC key pair
+    // Signature
+    inv_blinding_factor: Option<BigInt>,
 }
 
 // Structure holding P2's partially signed data
@@ -118,7 +130,8 @@ impl Client {
 
         Self {
             party_two_private_share_gen,
-            ec_key_pair_party2
+            ec_key_pair_party2,
+            inv_blinding_factor: None,
         }
     }
 
@@ -133,7 +146,7 @@ impl Client {
     }
 
     // P2 partially signs the message
-    pub fn partially_sign(&self, server_signing_data: &ServerSigningData, message: &BigInt ) -> ClientPartialSig {
+    pub fn partially_sign(&mut self, server_signing_data: &ServerSigningData, message: &BigInt ) -> ClientPartialSig {
 
         // creating the ephemeral private shares (k2):
         let (eph_party_two_first_message, eph_comm_witness, eph_ec_key_pair_party2) =
@@ -147,6 +160,14 @@ impl Client {
 
         let party2_private = party_two::Party2Private::set_private_key(&self.ec_key_pair_party2);
 
+        let (blinding_factor, inv_blinding_factor) = generate_blinding_factor();
+
+        self.inv_blinding_factor = Some(inv_blinding_factor.to_owned());
+
+        // P2's signature computation
+        // This is the partial signature that P2 will send to P1
+        // This function calculates the homomophic multiplication `c4 = c3 * blinding_factor`
+        // After P1 signs c4, P2 will multiply this partial signature by `1 / blinding_factor` to get the final signature 
         let partial_sig = party_two::PartialSig::compute_blinded(
             &server_signing_data.paillier_key_pair_ek,
             &server_signing_data.paillier_key_pair_encrypted_share,
@@ -154,6 +175,7 @@ impl Client {
             &eph_ec_key_pair_party2,
             &server_signing_data.eph_party_one_first_message.public_share,
             &message,
+            &blinding_factor,
         ); // Compute P2's partially signed data
 
         ClientPartialSig {
@@ -180,14 +202,25 @@ fn main() {
     let mut server = Server::new(); // Initialize the server (P1) with key generation
     let server_signing_data = server.start_signing(); // P1 generates ephemeral key pair and shares public key with P2 (start signing process)
 
-    let client = Client::new(); // Initialize the client (P2) with private share key generation
+    let mut client = Client::new(); // Initialize the client (P2) with private share key generation
     let client_partial_sig = client.partially_sign(&server_signing_data, &message); // P2 partially signs the message
 
     let blinded_signature = server.finish_signing(&client_partial_sig); // P1 finishes signing the message with P2's partially signed data
 
+    let inv_blinding_factor = client.inv_blinding_factor.as_ref().unwrap();
+
+    let q = Scalar::<Secp256k1>::group_order();
+
+    let unblinded_message_s1 = BigInt::mod_mul(&blinded_signature.s, &inv_blinding_factor, &q);
+
+    let unblinded_message_s = cmp::min(
+        unblinded_message_s1.clone(),
+        Scalar::<Secp256k1>::group_order().clone() - unblinded_message_s1,
+    );
+
     let signature = party_one::Signature {
         r: client_partial_sig.partial_sig.r,
-        s: blinded_signature.s,
+        s: unblinded_message_s,
     };
 
     let party_two_private_share_gen_public_share = client.get_party_two_private_share_gen_public_share(); // Get P2's public share key
